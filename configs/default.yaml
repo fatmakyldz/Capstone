@@ -1,0 +1,48 @@
+# capstone3 — Varsayılan konfigürasyon
+# Hızlı smoke-test için küçük değerler (3 task, küçük buffer)
+# Tam deney için: num_tasks: 5, memory_size: 2000, epochs_per_task: 10
+
+# ── Veri ve Task ──────────────────────────────────────────────────────────────
+data_dir: "./data"
+num_tasks: 3              # 3 task = 6 sınıf (CIFAR-10'dan ilk 3 task)
+classes_per_task: 2
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+num_classes: 10           # Paylaşılan classifier her zaman 10 çıkış
+feature_dim: 512          # ResNet18 çıktı boyutu
+freeze_backbone: false    # true → ResNet18 dondurulur, sadece classifier+fast eğitilir
+pretrained_backbone: false
+
+# ── Fast Memory ───────────────────────────────────────────────────────────────
+fast_hidden_multiplier: 4 # dim * multiplier = 512 * 4 = 2048 gizli katman
+fast_lr: 0.01             # Teach signal güncelleme adımı (backbone lr'dan bağımsız)
+fast_grad_clip: 1.0       # Her adımdaki fast gradient kırpma
+
+# ── Meta Optimizer ────────────────────────────────────────────────────────────
+backbone_lr: 0.0001       # Backbone için düşük lr (genel temsili koru)
+classifier_lr: 0.001      # Classifier için standart lr
+weight_decay: 0.0005
+optimizer: "adam"         # "adam" | "adamw" | "muon"
+
+# ── Eğitim ────────────────────────────────────────────────────────────────────
+epochs_per_task: 5        # Hızlı test için 5, tam deney için 10
+batch_size: 64
+replay_ratio: 0.4         # Toplam batch'in %40'ı replay (Task-0'da 0)
+current_weight: 1.0       # Current batch loss ağırlığı
+replay_weight: 1.0        # Replay batch loss ağırlığı
+
+# ── Replay Buffer ─────────────────────────────────────────────────────────────
+memory_size: 600          # Toplam örnekler (3 task × 2 class × 100/class)
+
+# ── EWC (opsiyonel regularizasyon) ────────────────────────────────────────────
+use_ewc: false            # EWC açık/kapalı
+ewc_lambda: 0.01          # EWC penalty katsayısı
+ewc_fisher_samples: 200   # Fisher tahmini için örnek sayısı
+
+# ── Teach Signal ──────────────────────────────────────────────────────────────
+run_teach_signal: true    # false → ablation: teach signal kapalı
+
+# ── Loglama ve Kaydetme ───────────────────────────────────────────────────────
+results_dir: "./results"
+log_interval: 20          # Her N batch'te bir loss yazdır
+seed: 42
