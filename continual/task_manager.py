@@ -1,12 +1,13 @@
 """
-Task definition ve yönetimi — CIFAR-10 class-incremental setup.
+Task definition ve yönetimi — class-incremental continual learning.
 
-CIFAR-10 → 5 task, her task'ta 2 sınıf:
-  Task-0: [0,1]  (airplane, automobile)
-  Task-1: [2,3]  (bird, cat)
-  Task-2: [4,5]  (deer, dog)
-  Task-3: [6,7]  (frog, horse)
-  Task-4: [8,9]  (ship, truck)
+Desteklenen veri setleri:
+  cifar10  → 10 sınıf,  5 task × 2 sınıf  (varsayılan)
+  cifar100 → 100 sınıf, 5 task × 20 sınıf
+
+Dinamik bölümleme:
+  classes_per_task = num_classes // num_tasks
+  Task-k: sınıflar [k*cpt, (k+1)*cpt)
 
 Tasarım: nested_learning/src/nested_learning/continual_streaming.py build_streaming_tasks()
 ile aynı prensip: etiket listesi task_size büyüklüğünde gruplara bölünür,
@@ -20,70 +21,120 @@ from __future__ import annotations
 
 import ssl
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torchvision
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, Subset
 
-# macOS SSL fix (capstone1/models.py'deki yöntemle aynı)
+# macOS SSL fix
 ssl._create_default_https_context = ssl._create_unverified_context
 
 
-# ── Task veri yapısı ─────────────────────────────────────────────────────────
+# ── Dataset metadata ──────────────────────────────────────────────────────────
+
+DATASET_CONFIGS: Dict[str, dict] = {
+    "cifar10": {
+        "num_classes":     10,
+        "normalize_mean":  (0.4914, 0.4822, 0.4465),
+        "normalize_std":   (0.247,  0.243,  0.261),
+        "torchvision_cls": "CIFAR10",
+    },
+    "cifar100": {
+        "num_classes":     100,
+        "normalize_mean":  (0.5071, 0.4867, 0.4408),
+        "normalize_std":   (0.2675, 0.2565, 0.2761),
+        "torchvision_cls": "CIFAR100",
+    },
+}
+
+
+# ── Task veri yapısı ──────────────────────────────────────────────────────────
 
 @dataclass
 class TaskDef:
-    task_id: int
-    class_ids: List[int]          # Bu task'a ait sınıf indeksleri
+    task_id:       int
+    class_ids:     List[int]      # Bu task'a ait sınıf indeksleri
     train_dataset: Subset
-    test_dataset: Subset
+    test_dataset:  Subset
 
 
-# ── CIFAR-10 task inşası ─────────────────────────────────────────────────────
+# ── Generic task builder ──────────────────────────────────────────────────────
 
-def build_cifar10_tasks(
-    data_dir: str = "./data",
-    num_tasks: int = 5,
-    classes_per_task: int = 2,
-    resize: tuple[int, int] | None = None,
+def build_tasks(
+    dataset_name:    str  = "cifar10",
+    data_dir:        str  = "./data",
+    num_tasks:       int  = 5,
+    classes_per_task: Optional[int] = None,   # None → auto: num_classes // num_tasks
+    resize:          Optional[Tuple[int, int]] = None,
 ) -> List[TaskDef]:
     """
-    CIFAR-10'u class-incremental task listesine dönüştürür.
+    Desteklenen herhangi bir veri setini class-incremental task listesine dönüştürür.
 
-    Sınıf bölümü (5 task × 2 sınıf = 10 sınıf):
-      Task 0: airplane(0), automobile(1)
-      Task 1: bird(2),     cat(3)
-      Task 2: deer(4),     dog(5)
-      Task 3: frog(6),     horse(7)
-      Task 4: ship(8),     truck(9)
+    Args:
+        dataset_name:     "cifar10" veya "cifar100"
+        data_dir:         Ham veri kök dizini
+        num_tasks:        Toplam task sayısı
+        classes_per_task: Her task'taki sınıf sayısı.
+                          None → num_classes // num_tasks (otomatik)
+        resize:           İsteğe bağlı (H, W) yeniden boyutlandırma
+
+    Örnekler:
+        CIFAR-10  + 5 task → 2 sınıf/task  (0-1, 2-3, 4-5, 6-7, 8-9)
+        CIFAR-100 + 5 task → 20 sınıf/task (0-19, 20-39, ...)
+        CIFAR-100 + 10 task → 10 sınıf/task
 
     Dönüş: List[TaskDef] — her biri train/test Subset'i barındırır.
     """
-    transform_list = [T.ToTensor(), T.Normalize((0.4914, 0.4822, 0.4465),
-                                                  (0.247,  0.243,  0.261))]
+    if dataset_name not in DATASET_CONFIGS:
+        raise ValueError(
+            f"Bilinmeyen veri seti: '{dataset_name}'. "
+            f"Desteklenenler: {list(DATASET_CONFIGS.keys())}"
+        )
+
+    cfg = DATASET_CONFIGS[dataset_name]
+    num_classes: int = cfg["num_classes"]
+
+    if classes_per_task is None:
+        classes_per_task = num_classes // num_tasks
+
+    if classes_per_task * num_tasks > num_classes:
+        raise ValueError(
+            f"{dataset_name}: {num_tasks} task × {classes_per_task} sınıf = "
+            f"{num_tasks * classes_per_task} > {num_classes} toplam sınıf"
+        )
+
+    # ── Dönüşümler ───────────────────────────────────────────────────────────
+    transform_list: List = [
+        T.ToTensor(),
+        T.Normalize(cfg["normalize_mean"], cfg["normalize_std"]),
+    ]
     if resize is not None:
         transform_list.insert(0, T.Resize(resize))
     transform = T.Compose(transform_list)
 
-    full_train = torchvision.datasets.CIFAR10(
-        root=data_dir, train=True, download=True, transform=transform
-    )
-    full_test = torchvision.datasets.CIFAR10(
-        root=data_dir, train=False, download=True, transform=transform
-    )
+    # ── Tam veri setini yükle (her task için Subset oluşturulacak) ────────────
+    ds_cls = getattr(torchvision.datasets, cfg["torchvision_cls"])
+    full_train = ds_cls(root=data_dir, train=True,  download=True, transform=transform)
+    full_test  = ds_cls(root=data_dir, train=False, download=True, transform=transform)
 
+    # Hız optimizasyonu: tüm etiketleri bir kez ön-bellekle (set lookup O(1))
+    train_labels = [int(lbl) for _, lbl in full_train]
+    test_labels  = [int(lbl) for _, lbl in full_test]
+
+    # ── Task listesini oluştur ────────────────────────────────────────────────
     tasks: List[TaskDef] = []
     for task_id in range(num_tasks):
         start = task_id * classes_per_task
-        end = start + classes_per_task
-        if start >= 10:
+        end   = start + classes_per_task
+        if start >= num_classes:
             break
-        class_ids = list(range(start, min(end, 10)))
+        class_ids = list(range(start, min(end, num_classes)))
+        class_set = set(class_ids)
 
-        train_indices = [i for i, (_, lbl) in enumerate(full_train) if lbl in class_ids]
-        test_indices  = [i for i, (_, lbl) in enumerate(full_test)  if lbl in class_ids]
+        train_indices = [i for i, lbl in enumerate(train_labels) if lbl in class_set]
+        test_indices  = [i for i, lbl in enumerate(test_labels)  if lbl in class_set]
 
         tasks.append(TaskDef(
             task_id=task_id,
@@ -93,6 +144,24 @@ def build_cifar10_tasks(
         ))
 
     return tasks
+
+
+# ── Backward-compatible CIFAR-10 wrapper ──────────────────────────────────────
+
+def build_cifar10_tasks(
+    data_dir:        str  = "./data",
+    num_tasks:       int  = 5,
+    classes_per_task: int = 2,
+    resize:          Optional[Tuple[int, int]] = None,
+) -> List[TaskDef]:
+    """CIFAR-10 task listesi (geriye dönük uyumluluk için korundu)."""
+    return build_tasks(
+        dataset_name="cifar10",
+        data_dir=data_dir,
+        num_tasks=num_tasks,
+        classes_per_task=classes_per_task,
+        resize=resize,
+    )
 
 
 # ── TaskManager: task geçiş olaylarını yönetir ───────────────────────────────
@@ -149,7 +218,7 @@ class TaskManager:
             pin_memory=False,
         )
 
-    def get_test_loaders(self) -> dict[int, DataLoader]:
+    def get_test_loaders(self) -> Dict[int, DataLoader]:
         """Şimdiye kadar görülen tüm task'ların test loader'ları."""
         return {
             t.task_id: DataLoader(

@@ -156,9 +156,16 @@ def train_one_step(
     optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
 
-    # Classifier gradient masking: sadece current task sınıfları güncellenir
-    # Kaynak: capstone2/train_continual.py mask_old_class_grads()
-    mask_old_class_grads(model.classifier, current_class_ids, device)
+    # Classifier gradient masking: current task + replay sınıfları güncellenir.
+    # Sadece current_class_ids kullanmak → eski sınıf head'lerinin ASLA güncellenmemesi
+    # demektir (replay gradientı da sıfırlanır) → backbone evrimleşir ama head'ler
+    # donup kalır → Task 0 accuracy %0'a düşer. Düzeltme: replay label'larından
+    # gelen sınıfları da izin verilenler listesine ekle.
+    if rep_labels is not None:
+        _allowed = list(set(current_class_ids) | set(rep_labels.tolist()))
+    else:
+        _allowed = current_class_ids
+    mask_old_class_grads(model.classifier, _allowed, device)
 
     # Gradient clipping (kararlılık için)
     # Projector parametreleri meta-optimizer'a dahil, birlikte clip edilir.

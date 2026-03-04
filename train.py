@@ -42,12 +42,13 @@ from torch.utils.data import DataLoader
 # Proje kökünü path'e ekle
 sys.path.insert(0, os.path.dirname(__file__))
 
-from continual.task_manager import TaskManager, build_cifar10_tasks
+from continual.task_manager import DATASET_CONFIGS, TaskManager, build_tasks
 from evaluation.metrics import ContinualMetrics
 from memory.replay_buffer import ReplayBuffer
 from models.continual_model import ContinualModel
 from training.engine import evaluate_task, train_one_step
 from training.loss import compute_ewc_fisher, ewc_penalty
+from training.metrics_logger import MetricsLogger
 from training.sigreg import SIGRegProjector
 
 
@@ -59,13 +60,19 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="capstone3 — HOPE-style Continual Learning")
 
     # Task / Veri
+    p.add_argument("--dataset",          type=str,   default="cifar10",
+                   choices=list(DATASET_CONFIGS.keys()),
+                   help="Veri seti: cifar10 (10 sınıf) veya cifar100 (100 sınıf)")
     p.add_argument("--data_dir",         type=str,   default="./data")
-    p.add_argument("--num_tasks",        type=int,   default=3,
-                   help="Kaç task çalıştırılacak (max 5, her task 2 sınıf)")
-    p.add_argument("--classes_per_task", type=int,   default=2)
+    p.add_argument("--num_tasks",        type=int,   default=5,
+                   help="Toplam task sayısı")
+    p.add_argument("--classes_per_task", type=int,   default=None,
+                   help="Her task'taki sınıf sayısı. "
+                        "None → num_classes // num_tasks (otomatik)")
 
     # Model
-    p.add_argument("--num_classes",           type=int,   default=10)
+    p.add_argument("--num_classes",           type=int,   default=None,
+                   help="Toplam sınıf sayısı. None → veri setinden otomatik")
     p.add_argument("--feature_dim",           type=int,   default=512)
     p.add_argument("--freeze_backbone",       action="store_true")
     p.add_argument("--freeze_backbone_until", type=int, default=0,
@@ -141,7 +148,39 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_interval", type=int, default=20)
     p.add_argument("--seed",         type=int, default=42)
 
+    # Metrics logger
+    p.add_argument("--metrics_csv",          type=str,   default=None,
+                   help="CSV dosya yolu; None → loglama kapalı")
+    p.add_argument("--convergence_threshold", type=float, default=None,
+                   help="Val accuracy (%) convergence_time_s için eşik değeri")
+    p.add_argument("--hw_sample_interval",   type=int,   default=20,
+                   help="GPU/CPU metrikleri kaç adımda bir örneklenir")
+
     return p.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """
+    Parse sonrası otomatik değer doldurma ve doğrulama.
+
+    - num_classes  → veri setinden otomatik (override edilebilir)
+    - classes_per_task → num_classes // num_tasks (override edilebilir)
+    """
+    cfg = DATASET_CONFIGS[args.dataset]
+
+    if args.num_classes is None:
+        args.num_classes = cfg["num_classes"]
+
+    if args.classes_per_task is None:
+        args.classes_per_task = args.num_classes // args.num_tasks
+
+    if args.classes_per_task * args.num_tasks > args.num_classes:
+        raise ValueError(
+            f"--classes_per_task ({args.classes_per_task}) × "
+            f"--num_tasks ({args.num_tasks}) = "
+            f"{args.classes_per_task * args.num_tasks} > "
+            f"num_classes ({args.num_classes})"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +329,8 @@ def run(args) -> ContinualMetrics:
 
     # ── Task listesi ──────────────────────────────────────────────────────────
     # nested_learning karşılığı: build_streaming_tasks()
-    tasks = build_cifar10_tasks(
+    tasks = build_tasks(
+        dataset_name=args.dataset,
         data_dir=args.data_dir,
         num_tasks=args.num_tasks,
         classes_per_task=args.classes_per_task,
@@ -346,6 +386,29 @@ def run(args) -> ContinualMetrics:
     # nested_learning karşılığı: ContinualEvalResult
     metrics = ContinualMetrics(num_tasks=args.num_tasks)
 
+    # ── CSV performance logger ────────────────────────────────────────────────
+    # Experiment tag: {dataset}_{num_tasks}t_{epochs_per_task}e_{memory_size}m
+    exp_tag = (
+        f"{args.dataset}_t{args.num_tasks}"
+        f"_e{args.epochs_per_task}_m{args.memory_size}"
+    )
+    exp_dir = os.path.join(args.results_dir, exp_tag)
+    os.makedirs(exp_dir, exist_ok=True)
+
+    step_csv_path    = args.metrics_csv or os.path.join(exp_dir, "perf_steps.csv")
+    summary_csv_path = os.path.join(args.results_dir, "metrics.csv")
+
+    perf_logger = MetricsLogger(
+        output_path=step_csv_path,
+        summary_path=summary_csv_path,
+        rank=0,                          # single-GPU/CPU; DDP callers pass dist.get_rank()
+        convergence_threshold=args.convergence_threshold,
+        hw_sample_interval=args.hw_sample_interval,
+    )
+    perf_logger.start_training()
+    print(f"[PerfLogger] Step CSV    → {step_csv_path}")
+    print(f"[PerfLogger] Summary CSV → {summary_csv_path}")
+
     # EWC state
     ewc_fisher, ewc_means = {}, {}
 
@@ -365,12 +428,15 @@ def run(args) -> ContinualMetrics:
     # nested_learning karşılığı: continual_streaming.py satır 208
     #   for current_task, task in enumerate(tasks):
     # ══════════════════════════════════════════════════════════════════════════
+    global_step = 0   # global step counter across all tasks / epochs
+
     for task_id in range(args.num_tasks):
         current_task = task_manager.advance()
         class_ids = current_task.class_ids
         print(f"\n{'='*55}")
         print(f"  Task {task_id}  |  Sınıflar: {class_ids}")
         print(f"{'='*55}")
+        perf_logger.start_task(task_id)
 
         # ── Optimizer reset at every task boundary ────────────────────────────
         if task_id == 0:
@@ -415,6 +481,7 @@ def run(args) -> ContinualMetrics:
             model.train()
             running_loss = 0.0
             n_batches = 0
+            perf_logger.start_epoch(epoch)
 
             for batch_i, (cur_imgs, cur_lbls) in enumerate(train_loader):
                 cur_imgs = cur_imgs.to(device)
@@ -428,6 +495,8 @@ def run(args) -> ContinualMetrics:
                     )
                     if rep_sample is not None:
                         rep_imgs, rep_lbls = rep_sample
+
+                perf_logger.step_start()
 
                 # ── İKİ-PASAJ EĞİTİM ADIMI ────────────────────────────────
                 # nested_learning: Pass-1 forward + compute_teach_signal +
@@ -465,6 +534,17 @@ def run(args) -> ContinualMetrics:
                     lambda_sig=args.lambda_sig,
                 )
 
+                global_step += 1
+                # Total images that went through the forward pass this step
+                # (current + replay — engine.py cats them into one batch)
+                _imgs_this_step = cur_imgs.size(0) + (
+                    rep_imgs.size(0) if rep_imgs is not None else 0
+                )
+                perf_logger.log_step(
+                    task_id, epoch, global_step,
+                    result["loss"], _imgs_this_step,
+                )
+
                 # ── EMA teacher update (per step) ─────────────────────────────
                 # teacher = α*teacher + (1-α)*student
                 # Bu, task boundary'de teacher'ın ani sıçrama yapmasını engeller.
@@ -483,6 +563,7 @@ def run(args) -> ContinualMetrics:
             avg_epoch_loss = running_loss / max(n_batches, 1)
             print(f"  ✓ Epoch {epoch+1}/{args.epochs_per_task} tamamlandı "
                   f"| Ortalama Loss: {avg_epoch_loss:.4f}")
+            perf_logger.log_epoch_end(task_id, epoch, global_step=global_step)
 
         # ── LwF: teacher snapshot — frozen copy of model at end of this task ────
         # Used as the distillation target for the NEXT task.
@@ -549,6 +630,14 @@ def run(args) -> ContinualMetrics:
             )
             metrics.record(task_idx=prev_tid, time_step=task_id, accuracy=acc)
             print(f"    Task {prev_tid}: {acc:.2f}%")
+            # Log val_accuracy for the *current* task being evaluated
+            if prev_tid == task_id:
+                perf_logger.log_epoch_end(
+                    task_id,
+                    epoch=args.epochs_per_task - 1,
+                    val_accuracy=acc,
+                    global_step=global_step,
+                )
 
         # Task-0 hatırlama eğrisi
         metrics.record_task0(
@@ -556,6 +645,30 @@ def run(args) -> ContinualMetrics:
                 model, all_test_loaders[0], device,
                 bic_alpha=BIC_A, bic_beta=BIC_B, bic_old_count=bic_old_count,
             )
+        )
+
+        # ── Task-level summary logging ────────────────────────────────────────
+        # Compute running avg_accuracy and avg_forgetting over seen tasks
+        _seen_accs = [
+            metrics.task_acc[i][task_id]
+            for i in range(task_id + 1)
+        ]
+        _valid_accs = [a for a in _seen_accs if a == a]   # filter NaN
+        _running_avg = sum(_valid_accs) / len(_valid_accs) if _valid_accs else 0.0
+        _forgettings = [
+            metrics._best_acc[i] - metrics.task_acc[i][task_id]
+            for i in range(task_id + 1)
+            if metrics.task_acc[i][task_id] == metrics.task_acc[i][task_id]
+        ]
+        _running_fgt = sum(_forgettings) / len(_forgettings) if _forgettings else 0.0
+
+        perf_logger.log_task_summary(
+            task_id=task_id,
+            epoch=args.epochs_per_task - 1,
+            task_accuracies=[metrics.task_acc[i][task_id] for i in range(task_id + 1)],
+            avg_accuracy_final=_running_avg,
+            avg_forgetting=_running_fgt,
+            device=device,
         )
 
         # bic_old_count: Task_id'nin sınıfları artık "eski" sayılır — sonraki
@@ -567,6 +680,7 @@ def run(args) -> ContinualMetrics:
         if device.type == "mps":
             torch.mps.empty_cache()
 
+    perf_logger.close()
     return metrics
 
 
@@ -574,24 +688,53 @@ def run(args) -> ContinualMetrics:
 # 4. Sonuçları kaydet
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_results(metrics: ContinualMetrics, args) -> None:
-    os.makedirs(args.results_dir, exist_ok=True)
+def _system_info() -> dict:
+    """Collect reproducibility metadata: git hash, Python, PyTorch, CUDA."""
+    import platform
+    import subprocess
 
-    # JSON
-    tag = f"hope_t{args.num_tasks}_e{args.epochs_per_task}_m{args.memory_size}"
+    info: dict = {
+        "python_version": sys.version.split()[0],
+        "torch_version":  torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version":   torch.version.cuda if torch.cuda.is_available() else None,
+        "mps_available":  torch.backends.mps.is_available(),
+        "platform":       platform.platform(),
+        "git_commit":     None,
+    }
+    try:
+        info["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        pass
+    return info
+
+
+def save_results(metrics: ContinualMetrics, args) -> None:
+    import datetime
+
+    # Timestamped experiment subdirectory: results/{dataset}_{tag}_{timestamp}/
+    tag = f"{args.dataset}_t{args.num_tasks}_e{args.epochs_per_task}_m{args.memory_size}"
     if args.no_teach_signal:
         tag += "_nots"
     if args.use_ewc:
         tag += "_ewc"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_dir = os.path.join(args.results_dir, f"{tag}_{timestamp}")
+    os.makedirs(exp_dir, exist_ok=True)
 
-    json_path = os.path.join(args.results_dir, f"{tag}_metrics.json")
+    # metrics.json
+    json_path = os.path.join(exp_dir, "metrics.json")
     metrics.save(json_path)
 
-    # Argümanlar da kaydedilsin
-    cfg_path = os.path.join(args.results_dir, f"{tag}_config.json")
+    # config.json — experiment args + reproducibility metadata
+    cfg_path = os.path.join(exp_dir, "config.json")
     with open(cfg_path, "w") as f:
-        json.dump(vars(args), f, indent=2)
-    print(f"[Kayıt] Config: {cfg_path}")
+        json.dump({"args": vars(args), "system": _system_info()}, f, indent=2)
+    print(f"[Kayıt] Experiment dir : {exp_dir}")
+    print(f"[Kayıt] Metrics JSON   : {json_path}")
+    print(f"[Kayıt] Config JSON    : {cfg_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -600,10 +743,12 @@ def save_results(metrics: ContinualMetrics, args) -> None:
 
 if __name__ == "__main__":
     args = parse_args()
+    validate_args(args)   # fill auto-derived fields (num_classes, classes_per_task)
 
     print("\n" + "=" * 55)
     print("  capstone3 — HOPE-style Continual Learning")
     print("=" * 55)
+    print(f"  Dataset      : {args.dataset.upper()} ({args.num_classes} sınıf)")
     print(f"  Tasks        : {args.num_tasks} × {args.classes_per_task} sınıf")
     print(f"  Epochs/task  : {args.epochs_per_task}")
     print(f"  Memory size  : {args.memory_size}")

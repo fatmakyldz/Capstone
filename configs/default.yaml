@@ -3,12 +3,13 @@
 # Tam deney için: num_tasks: 5, memory_size: 2000, epochs_per_task: 10
 
 # ── Veri ve Task ──────────────────────────────────────────────────────────────
+dataset: "cifar10"        # "cifar10" (10 sınıf) | "cifar100" (100 sınıf)
 data_dir: "./data"
-num_tasks: 3              # 3 task = 6 sınıf (CIFAR-10'dan ilk 3 task)
-classes_per_task: 2
+num_tasks: 5              # CIFAR-10 → 2 sınıf/task | CIFAR-100 → 20 sınıf/task
+classes_per_task: ~       # null → otomatik: num_classes // num_tasks
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-num_classes: 10           # Paylaşılan classifier her zaman 10 çıkış
+num_classes: ~            # null → veri setinden otomatik (cifar10: 10, cifar100: 100)
 feature_dim: 512          # ResNet18 çıktı boyutu
 freeze_backbone: false    # true → ResNet18 dondurulur, sadece classifier+fast eğitilir
 pretrained_backbone: false
