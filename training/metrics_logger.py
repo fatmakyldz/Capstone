@@ -327,9 +327,14 @@ class MetricsLogger:
         # GPU utilization: pynvml (CUDA only)
         gpu_util = _fmt(self._hw_cache["gpu_util_pct"], 2) if device.type == "cuda" else ""
 
-        # Memory: torch.cuda.memory_allocated() for CUDA, psutil RAM for others
+        # Memory: device-specific sampling
         if device.type == "cuda":
             mem_mb: Optional[float] = torch.cuda.memory_allocated() / 1_048_576
+        elif device.type == "mps":
+            try:
+                mem_mb = torch.mps.current_allocated_memory() / 1_048_576
+            except Exception:
+                mem_mb = None
         elif _PSUTIL_OK:
             try:
                 mem_mb = _psutil.virtual_memory().used / 1_048_576

@@ -28,6 +28,7 @@ Pipeline (nested_learning referansları ile):
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import random
@@ -387,16 +388,24 @@ def run(args) -> ContinualMetrics:
     metrics = ContinualMetrics(num_tasks=args.num_tasks)
 
     # ── CSV performance logger ────────────────────────────────────────────────
-    # Experiment tag: {dataset}_{num_tasks}t_{epochs_per_task}e_{memory_size}m
+    # Experiment tag: {dataset}_t{N}_e{E}_m{M}[_nots][_ewc]_{timestamp}
+    # Timestamp üretimini burada yapıyoruz ki logger + save_results aynı
+    # klasörü paylaşsın (önceden save_results ayrı timestamp üretiyordu →
+    # CSV logger farklı klasöre yazıyor, sonuç JSON farklı klasöre → mismatch).
     exp_tag = (
         f"{args.dataset}_t{args.num_tasks}"
         f"_e{args.epochs_per_task}_m{args.memory_size}"
     )
-    exp_dir = os.path.join(args.results_dir, exp_tag)
+    if args.no_teach_signal:
+        exp_tag += "_nots"
+    if args.use_ewc:
+        exp_tag += "_ewc"
+    exp_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_dir = os.path.join(args.results_dir, f"{exp_tag}_{exp_timestamp}")
     os.makedirs(exp_dir, exist_ok=True)
 
     step_csv_path    = args.metrics_csv or os.path.join(exp_dir, "perf_steps.csv")
-    summary_csv_path = os.path.join(args.results_dir, "metrics.csv")
+    summary_csv_path = os.path.join(exp_dir, "metrics.csv")
 
     perf_logger = MetricsLogger(
         output_path=step_csv_path,
@@ -681,7 +690,7 @@ def run(args) -> ContinualMetrics:
             torch.mps.empty_cache()
 
     perf_logger.close()
-    return metrics
+    return metrics, exp_dir
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -711,17 +720,7 @@ def _system_info() -> dict:
     return info
 
 
-def save_results(metrics: ContinualMetrics, args) -> None:
-    import datetime
-
-    # Timestamped experiment subdirectory: results/{dataset}_{tag}_{timestamp}/
-    tag = f"{args.dataset}_t{args.num_tasks}_e{args.epochs_per_task}_m{args.memory_size}"
-    if args.no_teach_signal:
-        tag += "_nots"
-    if args.use_ewc:
-        tag += "_ewc"
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_dir = os.path.join(args.results_dir, f"{tag}_{timestamp}")
+def save_results(metrics: ContinualMetrics, args, exp_dir: str) -> None:
     os.makedirs(exp_dir, exist_ok=True)
 
     # metrics.json
@@ -761,11 +760,11 @@ if __name__ == "__main__":
     print(f"  Freeze bb    : {args.freeze_backbone}")
     print("=" * 55 + "\n")
 
-    metrics = run(args)
+    metrics, exp_dir = run(args)
 
     # Özet
     metrics.print_matrix()
     metrics.print_summary()
 
     # Kaydet
-    save_results(metrics, args)
+    save_results(metrics, args, exp_dir)
